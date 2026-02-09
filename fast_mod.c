@@ -21,7 +21,7 @@ static int32_t value = 0;
 
 struct fast_device {
     int32_t internal_value;
-    wait_queue_head_t queue; // The "bench" lives here
+    wait_queue_head_t queue;
     struct cdev cdev;
 };
 
@@ -33,29 +33,35 @@ static int drain_rdllist(struct eventpoll_shadow *ep, struct fast_wait_args *arg
 
     INIT_LIST_HEAD(&local_list);
 
-    // 1. LOCK & MOVE: Minimal time spent with IRQs disabled
+    // lock ep
     spin_lock_irqsave(&ep->lock, flags);
     
-    // Move all entries from rdllist to our local list
+    // combine and move all entries from rdllist to local_list
+    // plan is to do a bulk move for max_events later
     list_splice_init(&ep->rdllist, &local_list);
     
+    // unlock ep
     spin_unlock_irqrestore(&ep->lock, flags);
 
-    // 2. PROCESS: Now we can safely call copy_to_user (we aren't holding a lock!)
+    // note: we're the lockless monster :)
     list_for_each_entry_safe(epi, tmp, &local_list, rdllink) {
+        // we can only process as many items as mentioned in args->max_events
         if (count >= args->max_events) {
-            // If we hit the user's limit, put the rest back on the main list
+            // lock ep
             spin_lock_irqsave(&ep->lock, flags);
+            // thsi time we move the remaining items into the rdllist
             list_splice(&local_list, &ep->rdllist);
+            // unlock ep
             spin_unlock_irqrestore(&ep->lock, flags);
             break;
         }
 
+        // now we do the bulk move of the items
         if (copy_to_user(&args->events_buffer[count], &epi->event, sizeof(struct epoll_event))) {
             return -EFAULT;
         }
 
-        // Successfully copied, remove from our local list
+        // now we need to remove it from the ready list
         list_del_init(&epi->rdllink);
         count++;
     }
@@ -71,30 +77,14 @@ static long fast_epoll_wait(struct fast_device *dev, struct fast_wait_args *args
    	if (args->timeout_ms >= 0) {
    	    timeout_jiffies = msecs_to_jiffies(args->timeout_ms);
     }
-    // 1. Get the file structure from the FD
     f = fdget(args->epoll_fd);
     struct file *file_ptr = fd_file(f);
     if (!file_ptr) return -EBADF;
 
-    // 2. Validate it's actually an epoll file
-    // (Epoll files usually have a specific f_op pointer)
-    
-    // 3. Extract the internal eventpoll pointer
-    // Epoll stores its private data in f.file->private_data
     ep = (struct eventpoll_shadow *)file_ptr->private_data;
 
-    // 4. THE FAST PATH: Check the ready list
-    // We need a lock here because the kernel might be adding events 
-    // to this list from an interrupt or another core.
-    
-    /* Note: You'll need to find the spinlock offset in struct eventpoll too */
-    
     if (list_empty(&ep->rdllist)) {
-        // spin_unlock_irqrestore(&ep->lock, flags);
-        // long ret = wait_event_interruptible_timeout(ep->wq, !list_empty(&ep->rdllist), timeout_jiffies);
-        // 5. If empty, sleep on epoll's own wait queue
-        // This is the "secret sauce": we use their queue, but our logic
-        pr_info("FastMod: Epoll list empty, sleeping on epoll wq for %lld ms...\n", args->timeout_ms);
+        pr_info("sleeping on epoll wq for %lld ms...\n", args->timeout_ms);
         long ret = wait_event_interruptible_timeout(ep->wq, !list_empty(&ep->rdllist), timeout_jiffies);
         if (ret < 0) {
             fdput(f);
@@ -105,15 +95,12 @@ static long fast_epoll_wait(struct fast_device *dev, struct fast_wait_args *args
         }
     }
 
-    // 6. When we wake up, rdllist is guaranteed to have data
-    // You would then iterate rdllist and copy data to userspace
     event_count = drain_rdllist(ep, args);
     fdput(f);
     return event_count;
 }
 
 // fs.h 1527     long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
-// This function is triggered when userspace calls ioctl()
 static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     struct fast_wait_args args;
     struct fast_device *dev = (struct fast_device *)file->private_data;
@@ -146,7 +133,8 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 static int device_open(struct inode *inode, struct file *file) {
     struct fast_device *dev;
-    // Offset arithmetic magic
+    // container_of gets the struct of fast_device based on cdev... compile time magic
+    // we could have used this to get the unwrap
     dev = container_of(inode->i_cdev, struct fast_device, cdev);
     file->private_data = dev;
     return 0;
@@ -156,11 +144,10 @@ static __poll_t device_poll(struct file *file, poll_table *wait) {
     struct fast_device *dev = file->private_data;
     __poll_t mask = 0;
 
-    // This doesn't sleep! It just registers the 'wait' table
+    // this doesn't sleep! it just registers the 'wait' table
     // (which epoll provides) into our driver's wait_queue.
     poll_wait(file, &dev->queue, wait);
 
-    // If our condition is met, tell epoll we are ready to be read
     if (dev->internal_value > 0) {
         mask |= (EPOLLIN | EPOLLRDNORM);
     }
@@ -181,30 +168,34 @@ static int __init fast_mod_init(void) {
         return -ENOMEM;
     }
 
-    // 1. Allocate major number
+    // get number to device
     if (alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME) < 0) return -1;
 
-    // 2. Create device class
+    // create class (for udev)
     my_class = class_create(CLASS_NAME);
 
-    // 3. Create device node in /dev/
+    // create device in /dev/ with the class and dev number
     struct device *my_device = device_create(my_class, NULL, dev_num, NULL, DEVICE_NAME);
 
-    // 4. Initialize cdev structure
+    // waitqueue needs to be initialized
     init_waitqueue_head(&my_fast_device->queue);
+
+    // cdev needs to be initialzied
     cdev_init(&my_fast_device->cdev, &fops);
     my_fast_device->cdev.owner = THIS_MODULE;
+    // associate the cdev onto the dev_num, now dev_num's file contains cdev
     int errorCode = cdev_add(&my_fast_device->cdev, dev_num, 1);
     if (errorCode < 0) {
-        // Cleanup on failure
+        // clean up if fail
         device_destroy(my_class, dev_num);
         class_destroy(my_class);
         unregister_chrdev_region(dev_num, 1);
         kfree(my_fast_device);
-        pr_err("FastMod: Failure to add cdev errorCode %d, cleaned up\n", errorCode);
+        pr_err("failed to add cdev, errorCode %d, clean up done\n", errorCode);
         return -1;
     }
-    // Storing the driver data so we can clean up in exit
+
+    // storing the driver data so we can clean up in exit
     dev_set_drvdata(my_device, my_fast_device);
 
     pr_info("FastMod: Module loaded. Device: /dev/%s\n", DEVICE_NAME);
@@ -217,19 +208,19 @@ static void __exit fast_mod_exit(void) {
     my_device = class_find_device_by_devt(my_class, dev_num);
     if (my_device) {
         my_fast_device = dev_get_drvdata(my_device);
-        put_device(my_device); // Release the reference from find_device
+        put_device(my_device); // release the reference from find_device
     }
 
-    // 1. Destroy visible device node first
+    // destroy visible device node first
     device_destroy(my_class, dev_num);
     
-    // 2. Destroy the class
+    // destroy the class
     class_destroy(my_class);
 
-    // 3. Unregister the region
+    // unregister the dev num
     unregister_chrdev_region(dev_num, 1);
 
-    // 4. Finally, free the memory
+    // free the memory for my_fast_device and delete cdev
     if (my_fast_device) {
         cdev_del(&my_fast_device->cdev);
         kfree(my_fast_device);
@@ -241,5 +232,5 @@ module_init(fast_mod_init);
 module_exit(fast_mod_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("AI Partner");
-MODULE_DESCRIPTION("A fast IOCTL-driven kernel module");
+MODULE_AUTHOR("extract");
+MODULE_DESCRIPTION("A kernel module");

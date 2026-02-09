@@ -20,7 +20,6 @@ typedef struct {
     int write;
 } pipe_t;
 
-// 1. Helper to create the pipe
 pipe_t create_signaling_pipe(void) {
     int fds[2];
     if (pipe(fds) < 0) {
@@ -30,7 +29,6 @@ pipe_t create_signaling_pipe(void) {
     return (pipe_t){ .read = fds[0], .write = fds[1] };
 }
 
-// And for the epoll setup...
 int create_fast_epoll() {
     int ep_fd = epoll_create1(0);
     if (ep_fd < 0) {
@@ -38,12 +36,9 @@ int create_fast_epoll() {
         exit(EXIT_FAILURE);
     }
 
-
-
     return ep_fd;
 }
 
-// 2. Helper to register an FD with epoll
 void setup_epoll_monitoring(int ep_fd, int target_fd) {
     struct epoll_event ev = {
         .events = EPOLLIN,
@@ -81,21 +76,17 @@ int main() {
     pthread_t thread_id;
     struct epoll_event events_out[10];
 
-    // Step 1: Initialize signaling
     pipe_t signaling = create_signaling_pipe();
     int ep_fd = create_fast_epoll();
 
-    // Step 2: Setup Epoll
     setup_epoll_monitoring(ep_fd, signaling.read);
 
-    // Step 3: Start background worker
     struct thread_context ctx = {
         .pipe_write_fd = signaling.write,
         .timeout_usec = 1 * 1'000'000
     };
     create_thread(&thread_id, &ctx);
 
-    // Step 4: Call custom Kernel Fast-Path
     int dev_fd = open("/dev/fast_ioctl_dev", O_RDWR);
     if (dev_fd < 0) { perror("Device open failed"); return 1; }
 
@@ -109,7 +100,6 @@ int main() {
     printf("[Main] Entering Fast IOCTL wait...\n");
     int ret = ioctl(dev_fd, FAST_IOCTL_WAIT, &args);
 
-    // Step 5: Handle Results
     if (ret < 0) {
         perror("IOCTL failed");
     } else if (ret == 0) {
@@ -117,10 +107,11 @@ int main() {
     } else {
         printf("[Main] SUCCESS! Woke up with %d event(s).\n", ret);
         uint64_t dummy;
-        read(signaling.read, &dummy, sizeof(dummy)); // Drain pipe
+        // neeed to read the fd otherwise it cant be closed
+        read(signaling.read, &dummy, sizeof(dummy));
     }
 
-    // Cleanup
+    // clean up
     pthread_join(thread_id, NULL);
     close(signaling.read); close(signaling.write);
     close(ep_fd); close(dev_fd);
